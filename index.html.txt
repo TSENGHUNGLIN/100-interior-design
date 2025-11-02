@@ -1,0 +1,1091 @@
+<!-- Chosen Palette: Cool Indigo & Slate -->
+<!-- Application Structure Plan: 
+    此儀表板結構已重構，以支援「先驗證、後授權」的安全模型。
+    1.  預設視圖 (Login): 頁面載入時，預設顯示「登入容器」(#login-container)，儀表板內容 (#dashboard-content) 則隱藏。
+    2.  驗證 (AuthN): 使用者點擊「使用 Google 登入」。Firebase Auth 透過 Google Provider 處理驗證。
+    3.  授權 (AuthZ): 
+        - onAuthStateChanged 偵測到使用者登入。
+        - 程式呼叫 checkAuthorization(user)。
+        - 此函數會查詢 Firestore 中 /artifacts/{appId}/whitelist/{user.email} 的文件。
+    4.  條件式 UI:
+        - 狀態 A (授權成功): `whitelist` 中存在該 email。隱藏載入畫面，顯示儀表板 (#dashboard-content)。此時才呼叫 listenForData() 來載入並顯示公司數據。
+        - 狀態 B (未授權): `whitelist` 中不存在該 email。隱藏載入畫面，顯示「未授權容器」(#unauthorized-container)，並提示使用者聯繫管理員。
+        - 狀態 C (登出): 顯示「登入容器」。
+    此結構確保了只有經過驗證和明確授權的使用者才能存取敏感的儀表板數據，同時為不同狀態提供了清晰的 UI。
+-->
+<!-- Visualization & Content Choices: 
+    1.  報告資訊: 儀表板數據（卡片、表格、AI 搜尋）。
+    2.  目標: 保護儀表板，只允許特定 Google 帳戶存取。
+    3.  呈現方式:
+        - 登入按鈕 (HTML): 觸發 Google 登入流程。
+        - 載入畫面 (HTML/CSS): 在 checkAuthorization 期間顯示。
+        - 未授權訊息 (HTML): 向登入但未在白名單中的使用者顯示。
+        - 儀表板 (HTML): 成功授權後顯示的完整應用程式。
+    4.  互動:
+        - signInWithGoogle(): 呼叫 Firebase signInWithRedirect。
+        - signOutUser(): 呼叫 auth.signOut()，觸發 onAuthStateChanged，UI 返回登入畫面。
+    5.  理由: 這是實現企業級存取控制的標準模式。
+-->
+<!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>100設計─人氣公司比較表 (Google 登入版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', 'Noto Sans TC', sans-serif;
+            background-color: #f0f4f8;
+            background-image: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        }
+        .highlight {
+            background-color: #fffbeb !important;
+            border-left: 4px solid #facc15;
+        }
+        .modal { transition: opacity 0.3s ease-in-out; }
+        .modal > div { transition: transform 0.3s ease-in-out; }
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .fade-in-up { animation: fadeInUp 0.5s ease-in-out forwards; }
+        .summary-card { opacity: 0; }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-radius: 50%;
+            border-top: 4px solid #4f46e5;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .prose-custom { line-height: 1.7; }
+        .prose-custom br { content: ""; display: block; margin-bottom: 0.5rem; }
+    </style>
+</head>
+<body class="p-4 sm:p-6 md:p-8">
+
+    <!-- 載入畫面 (預設顯示) -->
+    <div id="loading-container" class="flex justify-center items-center min-h-[80vh]">
+        <div class="flex flex-col items-center">
+            <div class="loader"></div>
+            <p class="mt-4 text-gray-600 font-medium">正在驗證您的身份...</p>
+        </div>
+    </div>
+
+    <!-- 登入畫面 (預設隱藏) -->
+    <div id="login-container" class="hidden max-w-md mx-auto mt-20 text-center bg-white p-10 rounded-xl shadow-lg fade-in-up">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-indigo-600 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        <h1 class="text-2xl font-bold text-gray-800 mt-4">儀表板存取權限</h1>
+        <p class="text-gray-500 mt-2 mb-6">請使用您的 Google 帳號登入以存取資料。</p>
+        <button id="google-login-button" class="w-full bg-indigo-600 text-white px-4 py-3 rounded-lg font-medium hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-200 shadow-sm hover:shadow-md flex items-center justify-center gap-2">
+            <svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><path fill="#fff" d="M24 9.8c1.8 0 3.6.7 4.9 2l3-3c-1.8-1.7-4.1-2.7-6.8-2.8C17.1 6 11 11.8 11 19.4c0 2.5.7 5 2 7.2l3.2-2.5c-.5-1.1-.8-2.3-.8-3.6 0-4.3 3.3-7.7 7.6-7.7z" /><path fill="#fff" d="M44.5 24.3c0-1.6-.1-3.1-.4-4.6H24v8.7h11.5c-.5 2.8-2 5.3-4.4 7l3.1 2.4c1.9-1.8 3.1-4.4 3.7-7.2 2.1-1.6 3.6-4.1 3.6-7.1z" /><path fill="#fff" d="M24 45c-4.1 0-7.8-1.4-10.7-3.8l3.2-2.5c1.2 1 2.8 1.6 4.6 1.6 3.4 0 6.3-2.3 7.3-5.4l3.1 2.4c-1.8 3.4-5.3 5.7-9.5 5.7z" /><path fill="#fff" d="M11.1 28.1c-.2-.7-.4-1.4-.4-2.1 0-.7.1-1.4.4-2.1l-3.2-2.5c-.8 1.6-1.3 3.3-1.3 5.1s.5 3.5 1.3 5.1l3.2-2.5z" /></svg>
+            使用 Google 登入
+        </button>
+    </div>
+
+    <!-- 未經授權畫面 (預設隱藏) -->
+    <div id="unauthorized-container" class="hidden max-w-md mx-auto mt-20 text-center bg-white p-10 rounded-xl shadow-lg fade-in-up">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-red-500 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+        </svg>
+        <h1 class="text-2xl font-bold text-gray-800 mt-4">存取被拒</h1>
+        <p class="text-gray-500 mt-2 mb-6">您的帳號 (<span id="unauthorized-email" class="font-medium text-gray-700"></span>) 未被授權存取此儀表板。</p>
+        <p class="text-sm text-gray-500">請聯繫系統管理員，要求將您的帳號加入核准清單。</p>
+        <button id="logout-button-unauth" class="mt-6 w-full bg-gray-500 text-white px-4 py-2 rounded-lg font-medium hover:bg-gray-600 transition-colors">
+            登出
+        </button>
+    </div>
+
+
+    <!-- 主要儀表板內容 (預設隱藏) -->
+    <div id="dashboard-content" class="max-w-7xl mx-auto hidden">
+        <!-- Header -->
+        <header class="mb-6 fade-in-up">
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center">
+                 <div class="flex items-center gap-3">
+                     <div class="bg-white p-2 rounded-lg shadow-sm">
+                         <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                             <path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                         </svg>
+                     </div>
+                     <div>
+                         <h1 class="text-2xl sm:text-3xl font-bold text-gray-800">100設計─人氣公司比較表</h1>
+                         <p class="text-gray-500 mt-1">日期: 11月1日 (點擊公司可查看獨立分析或與晨陽設計比較)</p>
+                     </div>
+                 </div>
+                 <!-- AI Search Bar -->
+                 <div class="w-full md:w-auto mt-4 md:mt-0">
+                     <label for="ai-search" class="text-sm font-medium text-gray-600">Google AI 智慧搜尋</label>
+                     <div class="relative mt-1">
+                         <input type="search" id="ai-search-input" class="w-full md:w-80 pl-4 pr-10 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors" placeholder="輸入問題以進行整合分析...">
+                         <button id="ai-search-button" class="absolute inset-y-0 right-0 flex items-center pr-3">
+                             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-gray-400 hover:text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                 <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                             </svg>
+                         </button>
+                     </div>
+                     <div id="suggested-questions" class="mt-2 flex flex-wrap gap-2">
+                         <button class="bg-gray-200 text-gray-700 text-xs font-medium px-3 py-1 rounded-full hover:bg-indigo-100 hover:text-indigo-700 transition-colors">載入中...</button>
+                     </div>
+                 </div>
+            </div>
+             <!-- 使用者資訊 & 登出按鈕 -->
+             <div class="bg-white p-4 rounded-lg shadow-sm mt-4 flex justify-between items-center">
+                <div>
+                    <span class="text-sm text-gray-500">已登入：</span>
+                    <span id="user-display" class="font-medium text-gray-700"></span>
+                </div>
+                <button id="logout-button-main" class="text-sm font-medium text-indigo-600 hover:text-indigo-800 transition-colors">
+                    登出
+                </button>
+            </div>
+        </header>
+
+        <!-- Summary Cards for ChenYang Design -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6" id="summary-cards">
+            <div class="bg-white p-5 rounded-xl shadow-lg flex items-center justify-center col-span-full h-32">
+                <div class="loader"></div>
+                <p class="ml-4 text-gray-600">正在載入晨陽設計數據...</p>
+            </div>
+        </div>
+
+        <!-- Main Content: Data Table with Controls -->
+        <div class="bg-white rounded-xl shadow-lg overflow-hidden fade-in-up" style="animation-delay: 0.3s;">
+             <div class="px-6 py-4 flex justify-between items-center border-b border-gray-200">
+                 <h2 class="text-lg font-semibold text-gray-700">公司數據總覽</h2>
+                 <div class="flex gap-2"> 
+                     <button id="add-company-button" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-200 shadow-sm hover:shadow-md">
+                         新增公司
+                     </button>
+                     <button id="force-reload-button" class="bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-all duration-200 shadow-sm hover:shadow-md">
+                         強制更新資料
+                     </button>
+                 </div> 
+             </div>
+             <div class="overflow-x-auto">
+                 <table class="w-full text-sm text-left text-gray-600">
+                     <thead class="text-xs text-gray-700 uppercase bg-gray-100">
+                         <tr>
+                             <th scope="col" class="px-6 py-3 min-w-[200px]">公司名稱</th>
+                             <th scope="col" class="px-6 py-3 text-center">作品總數</th>
+                             <th scope="col" class="px-6 py-3 text-center">瀏覽總數</th>
+                             <th scope="col" class="px-6 py-3 text-center">作品客戶收藏總數</th>
+                             <th scope="col" class="px-6 py-3 text-center">客戶諮詢總數</th>
+                             <th scope="col" class="px-6 py-3 text-center">詢問增減數</th>
+                             <th scope="col" class="px-6 py-3 text-center">作品開箱文</th>
+                             <th scope="col" class="px-6 py-3 text-center">施工動態</th>
+                         </tr>
+                     </thead>
+                     <tbody id="company-data-table">
+                         <tr class="border-b">
+                            <td class="px-6 py-4 text-center" colspan="8">
+                                <div class="flex justify-center items-center p-4">
+                                    <div class="loader"></div>
+                                    <p class="ml-4 text-gray-600">正在連接資料庫並載入數據...</p>
+                                </div>
+                            </td>
+                         </tr>
+                     </tbody>
+                 </table>
+             </div>
+        </div>
+        
+        <!-- AI Search Results Section -->
+        <div id="ai-results-section" class="hidden mt-6 bg-white rounded-xl shadow-lg overflow-hidden fade-in-up">
+            <div class="px-6 py-4 flex justify-between items-center border-b border-gray-200 bg-gray-50">
+                <div class="flex items-center gap-3">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                    </svg>
+                    <h2 class="text-lg font-semibold text-gray-700">AI 智慧分析</h2>
+                </div>
+                <button id="ai-results-close-button" class="text-gray-400 bg-transparent hover:bg-gray-200 hover:text-gray-900 rounded-lg text-sm p-1.5 inline-flex items-center">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"></path></svg>
+                </button>
+            </div>
+            <div id="ai-results-content" class="p-6 max-h-[32rem] overflow-y-auto">
+                <!-- AI search results will be injected here -->
+            </div>
+        </div>
+
+        <!-- Pixnet Popularity Summary -->
+        <div class="mt-6 bg-white rounded-xl shadow-lg p-6 fade-in-up">
+            <h3 class="text-lg font-semibold text-gray-700 mb-4 border-b pb-3 flex items-center gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-pink-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.539 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.196-1.539-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.783-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+                </svg>
+                痞客邦總人氣數
+            </h3>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-center">
+                <div>
+                    <p class="text-sm text-gray-500">昨日人氣數</p>
+                    <p class="text-2xl font-bold text-gray-800">576,068</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-500">今日人氣數</p>
+                    <p class="text-2xl font-bold text-gray-800">576,091</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-500">增減數</p>
+                    <p class="text-2xl font-bold text-green-600">+23</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="text-center mt-8 text-sm text-gray-500">
+            <p>數據來源：痞客邦 & Firebase Firestore</p>
+        </footer>
+    </div>
+
+    <!-- Analysis Modal -->
+    <div id="analysis-modal" class="modal fixed inset-0 bg-gray-800 bg-opacity-60 hidden items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-lg shadow-xl w-full max-w-4xl transform scale-95">
+            <div class="p-6">
+                <div class="flex items-start justify-between">
+                    <h3 class="text-xl font-bold text-gray-900" id="modal-company-name"></h3>
+                    <button type="button" class="modal-close-button text-gray-400 bg-transparent hover:bg-gray-200 hover:text-gray-900 rounded-lg text-sm p-1.5 ml-auto inline-flex items-center">
+                        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"></path></svg>
+                    </button>
+                </div>
+                <div class="mt-4" id="modal-body-analysis">
+                    <!-- Analysis content will be injected here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            onAuthStateChanged, 
+            GoogleAuthProvider, 
+            signInWithRedirect, 
+            getRedirectResult, 
+            signOut,
+            signInWithCustomToken // Keep this for canvas token
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            onSnapshot, 
+            getDocs, 
+            addDoc, 
+            query, 
+            doc, 
+            setLogLevel, 
+            writeBatch,
+            getDoc // Import getDoc for authorization check
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // This is the initial data set to "seed" the database if it's empty.
+        const initialCompanyData = [
+            // DATA UPDATED FROM LATEST CSV (commas removed)
+            { company: '晨陽共好機構(晨陽)', isHighlight: true, 
+              works_today: 337, works_today_prev: 336, 
+              views: '830w', views_prev: '829.1w', 
+              collects_today: '8.3w', collects_today_prev: '8.3w',
+              inquiries_today: '6208', inquiries_today_prev: '6,113',
+              inquiry_change: 10, // MD file value
+              unboxing_today: 58, unboxing_today_prev: 55,
+              construction_dynamics_today: 2747, construction_dynamics_today_prev: 2742},
+            { company: '歐德集團', isHighlight: false, 
+              works_today: 301, works_today_prev: 297,
+              views: '132w', views_prev: '131.6w',
+              collects_today: '1.5w', collects_today_prev: '1.5w',
+              inquiries_today: '4728', inquiries_today_prev: '4,673', 
+              inquiry_change: 2, // MD file value
+              unboxing_today: 66, unboxing_today_prev: 65,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0 },
+            { company: '三商美福-室內設計系', isHighlight: false, 
+              works_today: 119, works_today_prev: 119,
+              views: '26.5w', views_prev: '26.3w',
+              collects_today: '2289', collects_today_prev: '2,274',
+              inquiries_today: '3153', inquiries_today_prev: '3,105',
+              inquiry_change: 3, // MD file value
+              unboxing_today: 74, unboxing_today_prev: 74,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '水設室內設計', isHighlight: false, 
+              works_today: 59, works_today_prev: 58,
+              views: '44.8w', views_prev: '44.7w', 
+              collects_today: '4692', collects_today_prev: '4,686',
+              inquiries_today: '2121', inquiries_today_prev: '2,111',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 12, unboxing_today_prev: 12,
+              construction_dynamics_today: 3, construction_dynamics_today_prev: 3},
+            { company: '安居空間設計', isHighlight: false, // Name changed
+              works_today: 42, works_today_prev: 42,
+              views: '21.3w', views_prev: '21.3w',
+              collects_today: '1378', collects_today_prev: '1,378',
+              inquiries_today: '264', inquiries_today_prev: '262',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 5, unboxing_today_prev: 5,
+              construction_dynamics_today: 7, construction_dynamics_today_prev: 7},
+            { company: '優德室內設計', isHighlight: false, 
+              works_today: 41, works_today_prev: 41,
+              views: '12.2w', views_prev: '12.2w',
+              collects_today: '790', collects_today_prev: '790',
+              inquiries_today: '48', inquiries_today_prev: '48',
+              inquiry_change: 0, 
+              unboxing_today: 0, unboxing_today_prev: 0,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '逸硯室內設計', isHighlight: false, // Name changed
+              works_today: 134, works_today_prev: 134,
+              views: '62.9w', views_prev: '62.5w',
+              collects_today: '8507', collects_today_prev: '8,485',
+              inquiries_today: '2817', inquiries_today_prev: '2,707',
+              inquiry_change: 10, // MD file value
+              unboxing_today: 12, unboxing_today_prev: 12,
+              construction_dynamics_today: 1, construction_dynamics_today_prev: 1},
+            { company: '木木設計', isHighlight: false, // Name changed
+              works_today: 39, works_today_prev: 39,
+              views: '30.9w', views_prev: '30.9w',
+              collects_today: '3722', collects_today_prev: '3,721',
+              inquiries_today: '391', inquiries_today_prev: '390', 
+              inquiry_change: 0, // MD file value
+              unboxing_today: 8, unboxing_today_prev: 8,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '羽筑設計', isHighlight: false, 
+              works_today: 141, works_today_prev: 141,
+              views: '172.9w', views_prev: '172.7w',
+              collects_today: '3.6w', collects_today_prev: '3.6w',
+              inquiries_today: '5012', inquiries_today_prev: '4,971',
+              inquiry_change: 6, // MD file value
+              unboxing_today: 11, unboxing_today_prev: 11,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '長寬高空間設計', isHighlight: false, 
+              works_today: 55, works_today_prev: 54,
+              views: '21.4w', views_prev: '21.4w',
+              collects_today: '2377', collects_today_prev: '2,377',
+              inquiries_today: '189', inquiries_today_prev: '185',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 2, unboxing_today_prev: 2,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '十幸制作', isHighlight: false, 
+              works_today: 17, works_today_prev: 17,
+              views: '1224', views_prev: '12w', // Big change here
+              collects_today: '217', collects_today_prev: '217',
+              inquiries_today: '169', inquiries_today_prev: '168',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 3, unboxing_today_prev: 3,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '一三設計', isHighlight: false, // Name changed
+              works_today: 134, works_today_prev: 134,
+              views: '-', views_prev: '-',
+              collects_today: '5.3w', collects_today_prev: '5.3w',
+              inquiries_today: '1063', inquiries_today_prev: '1,058',
+              inquiry_change: 1, // MD file value
+              unboxing_today: 9, unboxing_today_prev: 9,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '萬寶隆空間設計', isHighlight: false, 
+              works_today: 171, works_today_prev: 168,
+              views: '18.7w', views_prev: '18.7w',
+              collects_today: '1417', collects_today_prev: '1,416',
+              inquiries_today: '284', inquiries_today_prev: '280',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 0, unboxing_today_prev: 0,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: '六木設計', isHighlight: false, 
+              works_today: 31, works_today_prev: 31,
+              views: '583', views_prev: '583',
+              collects_today: '1.3w', collects_today_prev: '1.3w',
+              inquiries_today: '442', inquiries_today_prev: '442',
+              inquiry_change: 0, 
+              unboxing_today: 5, unboxing_today_prev: 5,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: 'Rz Interior Design 睿杰', isHighlight: false, // Name changed
+              works_today: 64, works_today_prev: 64,
+              views: '16.6w', views_prev: '16.6w',
+              collects_today: '1135', collects_today_prev: '1,135',
+              inquiries_today: '281', inquiries_today_prev: '279',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 5, unboxing_today_prev: 5,
+              construction_dynamics_today: 0, construction_dynamics_today_prev: 0},
+            { company: 'IN鴻設計', isHighlight: false, // Name changed
+              works_today: 7, works_today_prev: 6,
+              views: '5711', views_prev: '5,687',
+              collects_today: '16', collects_today_prev: '16',
+              inquiries_today: '63', inquiries_today_prev: '62',
+              inquiry_change: 0, // MD file value
+              unboxing_today: 0, unboxing_today_prev: 0,
+              construction_dynamics_today: 157, construction_dynamics_today_prev: 156},
+        ];
+        // END CSV DATA UPDATE
+
+        // Global variables
+        let db, auth, app;
+        let companyData = []; // This will be populated from Firestore
+        let baseCompanyData = null; // This will be populated from Firestore
+        let userId = null;
+        let companiesCollectionPath = '';
+        let whitelistCollectionPath = ''; // NEW
+        let appId = 'default-app-id'; // NEW
+
+        // DOM Elements
+        let tableBody, analysisModal, modalCompanyName, modalBodyAnalysis, searchInput, searchButton, suggestedQuestionsContainer, aiResultsSection, aiResultsContent, aiResultsCloseButton, addCompanyButton, forceReloadButton;
+        let loadingContainer, loginContainer, unauthorizedContainer, dashboardContent, userDisplay, unauthorizedEmail;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Get all DOM elements
+            tableBody = document.getElementById('company-data-table');
+            analysisModal = document.getElementById('analysis-modal');
+            modalCompanyName = document.getElementById('modal-company-name');
+            modalBodyAnalysis = document.getElementById('modal-body-analysis');
+            searchInput = document.getElementById('ai-search-input');
+            searchButton = document.getElementById('ai-search-button');
+            suggestedQuestionsContainer = document.getElementById('suggested-questions');
+            aiResultsSection = document.getElementById('ai-results-section');
+            aiResultsContent = document.getElementById('ai-results-content');
+            aiResultsCloseButton = document.getElementById('ai-results-close-button');
+            addCompanyButton = document.getElementById('add-company-button');
+            forceReloadButton = document.getElementById('force-reload-button');
+            
+            // Auth UI Elements
+            loadingContainer = document.getElementById('loading-container');
+            loginContainer = document.getElementById('login-container');
+            unauthorizedContainer = document.getElementById('unauthorized-container');
+            dashboardContent = document.getElementById('dashboard-content');
+            userDisplay = document.getElementById('user-display');
+            unauthorizedEmail = document.getElementById('unauthorized-email');
+
+            // Initialize Firebase
+            initializeAppFirebase();
+            
+            // Setup Event Listeners (will be attached in setupEventListeners)
+        });
+
+        async function initializeAppFirebase() {
+            try {
+                appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+                const firebaseConfig = JSON.parse(firebaseConfigStr);
+
+                if (!firebaseConfig.apiKey) {
+                    console.warn("Firebase config is empty.");
+                }
+
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                setLogLevel('debug');
+
+                companiesCollectionPath = `/artifacts/${appId}/public/data/companies`;
+                whitelistCollectionPath = `/artifacts/${appId}/whitelist`; // NEW: Path for whitelist
+                console.log(`Using Firestore companies path: ${companiesCollectionPath}`);
+                console.log(`Using Firestore whitelist path: ${whitelistCollectionPath}`);
+
+                // Check for redirect result first
+                try {
+                    const result = await getRedirectResult(auth);
+                    if (result) {
+                        // This will trigger onAuthStateChanged anyway, but good to log
+                        console.log("Google Sign-In redirect successful.", result.user);
+                    }
+                } catch (error) {
+                    console.error("Error handling redirect result: ", error);
+                }
+
+                // Main Auth Controller
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        // User is signed in.
+                        console.log("User is signed in:", user.uid, user.email);
+                        userId = user.uid;
+                        userDisplay.textContent = `${user.displayName} (${user.email})`;
+                        
+                        // NOW, check if they are authorized
+                        await checkAuthorization(user);
+                        
+                    } else {
+                        // User is signed out.
+                        console.log("User is not signed in.");
+                        userId = null;
+                        
+                        // Check if we have the canvas token
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            console.log("Attempting sign in with custom token...");
+                            try {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                                // This will re-trigger onAuthStateChanged with a user
+                            } catch (tokenError) {
+                                console.error("Custom token sign-in failed:", tokenError);
+                                // Fallback to showing login button
+                                showLoginUI();
+                            }
+                        } else {
+                            // No user, no token, show Google login button
+                            showLoginUI();
+                        }
+                    }
+                });
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                showLoginUI(); // Show login on init error
+                loadingContainer.innerHTML = `<p class="text-red-500">Firebase 初始化失敗: ${error.message}</p>`;
+            }
+        }
+
+        function showLoginUI() {
+            loadingContainer.classList.add('hidden');
+            dashboardContent.classList.add('hidden');
+            unauthorizedContainer.classList.add('hidden');
+            loginContainer.classList.remove('hidden');
+        }
+
+        async function checkAuthorization(user) {
+            if (!user || !user.email) {
+                console.log("No user or email found for authorization check.");
+                showLoginUI();
+                return;
+            }
+
+            console.log(`Checking authorization for: ${user.email}`);
+            try {
+                // Check against the whitelist
+                // The document ID *must* be the email address
+                const userAuthRef = doc(db, whitelistCollectionPath, user.email);
+                const docSnap = await getDoc(userAuthRef);
+
+                if (docSnap.exists()) {
+                    // USER IS AUTHORIZED
+                    console.log("Authorization successful.");
+                    loadingContainer.classList.add('hidden');
+                    loginContainer.classList.add('hidden');
+                    unauthorizedContainer.classList.add('hidden');
+                    dashboardContent.classList.remove('hidden');
+
+                    // NOW we can setup listeners and load data
+                    await seedDatabase();
+                    listenForData();
+                    setupEventListeners(); // Setup dashboard event listeners
+
+                } else {
+                    // USER IS NOT AUTHORIZED
+                    console.warn("Authorization FAILED. User not in whitelist.");
+                    loadingContainer.classList.add('hidden');
+                    loginContainer.classList.add('hidden');
+                    dashboardContent.classList.add('hidden');
+                    unauthorizedContainer.classList.remove('hidden');
+                    unauthorizedEmail.textContent = user.email;
+                    
+                    // Add listener for the logout button on the unauth page
+                    document.getElementById('logout-button-unauth').addEventListener('click', signOutUser);
+                }
+            } catch (error) {
+                console.error("Error checking authorization: ", error);
+                loadingContainer.innerHTML = `<p class="text-red-500">檢查權限時發生錯誤: ${error.message}</p>`;
+                // You might want to sign them out here
+                await signOutUser();
+            }
+        }
+        
+        function signInWithGoogle() {
+            console.log("Attempting Google Sign-In...");
+            const provider = new GoogleAuthProvider();
+            // Using redirect as it's more reliable than popup
+            signInWithRedirect(auth, provider);
+        }
+
+        async function signOutUser() {
+            console.log("Signing out user...");
+            try {
+                await signOut(auth);
+                // onAuthStateChanged will handle showing the login UI
+            } catch (error) {
+                console.error("Error signing out: ", error);
+            }
+        }
+
+        function setupEventListeners() {
+            // This function is now called AFTER authorization
+            // Remove listeners if they already exist to prevent duplicates (though it shouldn't be called twice)
+            
+            // Login button (if it hasn't been attached yet)
+            const loginButton = document.getElementById('google-login-button');
+            if (loginButton) {
+                loginButton.onclick = signInWithGoogle; // Use .onclick to avoid multiple adds
+            }
+
+            // Main Logout buttons
+            document.getElementById('logout-button-main').onclick = signOutUser;
+            document.getElementById('logout-button-unauth').onclick = signOutUser;
+
+            // Dashboard listeners
+            tableBody.addEventListener('click', e => {
+                const row = e.target.closest('tr');
+                if (row && row.dataset.id) {
+                    const companyId = row.dataset.id;
+                    const company = companyData.find(c => c.id === companyId);
+                    if (company) {
+                        showAnalysisModal(company);
+                    }
+                }
+            });
+
+            document.querySelectorAll('.modal-close-button').forEach(button => {
+                button.addEventListener('click', () => {
+                    hideModal(button.closest('.modal'));
+                });
+            });
+
+            analysisModal.addEventListener('click', e => {
+                if (e.target === analysisModal) hideModal(analysisModal);
+            });
+
+            searchButton.addEventListener('click', performAiSearch);
+            searchInput.addEventListener('keydown', e => {
+                if (e.key === 'Enter') performAiSearch();
+            });
+            
+            aiResultsCloseButton.addEventListener('click', () => {
+                aiResultsSection.classList.add('hidden');
+            });
+            
+            suggestedQuestionsContainer.addEventListener('click', (e) => {
+                if(e.target.tagName === 'BUTTON') {
+                    searchInput.value = e.target.textContent;
+                    performAiSearch();
+                }
+            });
+
+            addCompanyButton.addEventListener('click', async () => {
+                console.log("Adding new company...");
+                const companiesRef = collection(db, companiesCollectionPath);
+                try {
+                    const newCompany = {
+                        company: '新測試公司',
+                        isHighlight: false,
+                        works_today: 1, works_today_prev: 0,
+                        views: '100', views_prev: '0',
+                        collects_today: '1', collects_today_prev: '0',
+                        inquiries_today: '1', inquiries_today_prev: '0',
+                        inquiry_change: 1,
+                        unboxing_today: 0, unboxing_today_prev: 0,
+                        construction_dynamics_today: 0, construction_dynamics_today_prev: 0
+                    };
+                    const docRef = await addDoc(companiesRef, newCompany);
+                    console.log("New company added with ID: ", docRef.id);
+                } catch (e) {
+                    console.error("Error adding company: ", e);
+                }
+            });
+
+            forceReloadButton.addEventListener('click', () => { 
+                if (forceReloadButton.textContent === '您確定嗎？') {
+                    forceReloadData();
+                } else {
+                    const originalText = '強制更新資料';
+                    forceReloadButton.textContent = '您確定嗎？';
+                    forceReloadButton.disabled = true; 
+                    setTimeout(() => {
+                        if (forceReloadButton.textContent === '您確定嗎？') {
+                             forceReloadButton.textContent = originalText;
+                             forceReloadButton.disabled = false;
+                        }
+                    }, 3000); // Reset after 3 seconds
+                }
+            });
+        }
+
+        async function seedDatabase() {
+            // This function is now only called *after* authorization
+            const companiesRef = collection(db, companiesCollectionPath);
+            try {
+                const snapshot = await getDocs(companiesRef);
+                if (snapshot.empty) {
+                    console.log("Database is empty. Seeding data...");
+                    const seedPromises = initialCompanyData.map(company => {
+                        return addDoc(companiesRef, company);
+                    });
+                    await Promise.all(seedPromises);
+                    console.log("Seeding complete.");
+                } else {
+                    console.log("Database already contains data. Skipping seed.");
+                }
+            } catch (error) {
+                console.error("Error checking/seeding database: ", error);
+            }
+        }
+
+        function listenForData() {
+            // This function is now only called *after* authorization
+            console.log(`Setting up real-time listener for: ${companiesCollectionPath}`);
+            const companiesRef = collection(db, companiesCollectionPath);
+            const q = query(companiesRef); 
+
+            onSnapshot(q, (snapshot) => {
+                console.log("Received data update from Firestore.");
+                companyData = []; // Clear local data
+                snapshot.forEach((doc) => {
+                    companyData.push({ id: doc.id, ...doc.data() });
+                });
+                
+                companyData.sort((a, b) => {
+                    if (a.isHighlight) return -1;
+                    if (b.isHighlight) return 1;
+                    const inquiriesA = parseValue(a.inquiries_today) || 0;
+                    const inquiriesB = parseValue(b.inquiries_today) || 0;
+                    return inquiriesB - inquiriesA;
+                });
+
+                baseCompanyData = companyData.find(c => c.isHighlight);
+
+                if (baseCompanyData) {
+                    renderSummaryCards();
+                } else {
+                    document.getElementById('summary-cards').innerHTML = `<div class="bg-white p-5 rounded-xl shadow-lg flex items-center justify-center col-span-full h-32"><p class="text-red-500">錯誤：找不到標記的公司 (isHighlight: true)。</p></div>`;
+                }
+                
+                renderTable();
+                updateSuggestedQuestions();
+            }, (error) => {
+                console.error("Error with real-time listener: ", error);
+                tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center text-red-500">資料庫連線錯誤: ${error.message}</td></tr>`;
+                // This might happen if rules are correct on client but not on server
+                // Or if the user's auth token expired mid-session
+            });
+        }
+
+        async function forceReloadData() {
+            console.warn("Starting force reload. Deleting all existing data...");
+            forceReloadButton.disabled = true;
+            forceReloadButton.textContent = '更新中...';
+            
+            const companiesRef = collection(db, companiesCollectionPath);
+            
+            try {
+                // Step 1: Delete all existing documents
+                const snapshot = await getDocs(companiesRef);
+                if (!snapshot.empty) {
+                    const batch = writeBatch(db);
+                    snapshot.forEach(doc => {
+                        batch.delete(doc.ref);
+                    });
+                    await batch.commit();
+                    console.log("All existing data deleted.");
+                } else {
+                    console.log("No existing data to delete.");
+                }
+
+                // Step 2: Add all documents from initialCompanyData
+                console.log("Adding new data from initialCompanyData...");
+                const addBatch = writeBatch(db);
+                initialCompanyData.forEach(company => {
+                    const newDocRef = doc(companiesRef); // Create a new doc reference with a unique ID
+                    addBatch.set(newDocRef, company);
+                });
+                await addBatch.commit();
+                
+                console.log("Force reload complete. New data added.");
+                
+            } catch (error) {
+                console.error("Error during force reload: ", error);
+            } finally {
+                 forceReloadButton.textContent = '強制更新資料';
+                 forceReloadButton.disabled = false;
+            }
+        }
+
+        function renderTable() {
+            const colors = ['bg-red-50', 'bg-orange-50', 'bg-amber-50', 'bg-lime-50', 'bg-green-50', 'bg-emerald-50', 'bg-teal-50', 'bg-cyan-50', 'bg-sky-50', 'bg-blue-50', 'bg-indigo-50', 'bg-violet-50', 'bg-purple-50', 'bg-fuchsia-50', 'bg-pink-50', 'bg-rose-50'];
+            let tableHTML = '';
+            if (companyData.length === 0) {
+                 tableHTML = `<tr><td colspan="8" class="p-4 text-center text-gray-500">沒有公司資料。</td></tr>`;
+                 tableBody.innerHTML = tableHTML;
+                 return;
+            }
+
+            companyData.forEach((item, index) => {
+                const highlightClass = item.isHighlight ? 'highlight' : '';
+                const inquiryChangeColor = item.inquiry_change > 0 ? 'text-green-600' : (item.inquiry_change < 0 ? 'text-red-600' : 'text-gray-500');
+                const inquiryChangeSign = item.inquiry_change > 0 ? '+' : '';
+                const rowColor = item.isHighlight ? '' : colors[index % colors.length];
+
+                tableHTML += `
+                    <tr class="border-b hover:opacity-75 transition-opacity duration-150 cursor-pointer ${rowColor} ${highlightClass}" data-id="${item.id}">
+                        <td class="px-6 py-4 font-semibold text-gray-900 whitespace-nowrap">${item.company}</td>
+                        <td class="px-6 py-4 text-center">${item.works_today}</td>
+                        <td class="px-6 py-4 text-center"><div>${item.views}</div></td>
+                        <td class="px-6 py-4 text-center">${item.collects_today}</td>
+                        <td class="px-6 py-4 text-center">${item.inquiries_today}</td>
+                        <td class="px-6 py-4 text-center font-bold ${inquiryChangeColor}">${inquiryChangeSign}${item.inquiry_change}</td>
+                        <td class="px-6 py-4 text-center">${item.unboxing_today}</td>
+                        <td class="px-6 py-4 text-center">${item.construction_dynamics_today}</td>
+                    </tr>`;
+            });
+            tableBody.innerHTML = tableHTML;
+        }
+
+        function renderSummaryCards() {
+            const summaryContainer = document.getElementById('summary-cards');
+            if (!baseCompanyData || !summaryContainer) {
+                summaryContainer.innerHTML = `<div class="bg-white p-5 rounded-xl shadow-lg flex items-center justify-center col-span-full h-32"><p class="text-red-500">無法載入晨陽設計卡片 (資料遺失)。</p></div>`;
+                return;
+            }
+            
+            const inquiryChange = baseCompanyData.inquiry_change;
+            const inquiryChangeColor = inquiryChange > 0 ? 'text-green-600' : 'text-gray-500';
+            const inquiryChangeText = inquiryChange > 0 ? `+${inquiryChange}` : inquiryChange;
+            const constructionChange = baseCompanyData.construction_dynamics_today - baseCompanyData.construction_dynamics_today_prev;
+            const constructionChangeColor = constructionChange > 0 ? 'text-green-600' : (constructionChange < 0 ? 'text-red-600' : 'text-gray-500');
+            const constructionChangeText = constructionChange > 0 ? `+${constructionChange}` : constructionChange;
+            
+            const cards = [
+                { title: '作品總數', value: baseCompanyData.works_today, change: `+${baseCompanyData.works_today - baseCompanyData.works_today_prev} vs 昨日`, icon: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>` },
+                { title: '瀏覽總數', value: baseCompanyData.views, change: 'vs 昨日', icon: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>` },
+                { title: '作品客戶收藏總數', value: baseCompanyData.collects_today, change: 'vs 昨日', icon: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" /></svg>` },
+                { title: '客戶諮詢總數', value: baseCompanyData.inquiries_today, change: `<span class="${inquiryChangeColor}">${inquiryChangeText} vs 昨日</span>`, icon: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>` },
+                { title: '作品開箱文', value: baseCompanyData.unboxing_today, change: `+${baseCompanyData.unboxing_today - baseCompanyData.unboxing_today_prev} vs 昨日`, icon: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.246 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>` },
+                { title: '施工動態', value: baseCompanyData.construction_dynamics_today, change: `<span class="${constructionChangeColor}">${constructionChangeText} vs 昨日</span>`, icon: `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>`}
+            ];
+            let cardsHTML = '';
+            cards.forEach((card, i) => {
+                cardsHTML += `
+                    <div class="summary-card bg-white p-5 rounded-xl shadow-lg flex items-center gap-4 fade-in-up" style="animation-delay: ${0.05 * i}s;">
+                        <div class="bg-indigo-100 text-indigo-600 rounded-full h-12 w-12 flex-shrink-0 flex items-center justify-center">${card.icon}</div>
+                        <div>
+                            <p class="text-sm text-gray-500 font-medium">${card.title}</p>
+                            <p class="text-2xl font-bold text-gray-800">${card.value}</p>
+                            <p class="text-xs text-gray-400 mt-1">${card.change}</p>
+                        </div>
+                    </div>`;
+            });
+            summaryContainer.innerHTML = cardsHTML;
+        }
+
+        function updateSuggestedQuestions() {
+            suggestedQuestionsContainer.innerHTML = ''; // Clear
+            if (baseCompanyData) {
+                suggestedQuestionsContainer.innerHTML += `<button class="bg-gray-200 text-gray-700 text-xs font-medium px-3 py-1 rounded-full hover:bg-indigo-100 hover:text-indigo-700 transition-colors">${baseCompanyData.company}</button>`;
+            }
+            const compareCompany = companyData.find(c => !c.isHighlight); // Get first non-highlighted
+            if (baseCompanyData && compareCompany) {
+                 suggestedQuestionsContainer.innerHTML += `<button class="bg-gray-200 text-gray-700 text-xs font-medium px-3 py-1 rounded-full hover:bg-indigo-100 hover:text-indigo-700 transition-colors">比較 ${baseCompanyData.company.split('(')[0]} 與 ${compareCompany.company.split('-')[0]}</button>`;
+            }
+        }
+
+        function parseValue(value) {
+            if (typeof value !== 'string' && typeof value !== 'number') return null;
+            if (typeof value === 'number') return value;
+            if (value === '-' || String(value).trim() === '') return null;
+            let numStr = String(value).replace(/,/g, '');
+            if (numStr.toLowerCase().includes('w')) return parseFloat(numStr) * 10000;
+            return parseFloat(numStr);
+        }
+
+        function showAnalysisModal(compareCompanyData) {
+            if (!compareCompanyData) return;
+            if (!baseCompanyData) {
+                console.error("Base company data is not loaded, cannot show modal.");
+                return;
+            }
+
+            if (compareCompanyData.isHighlight) {
+                modalCompanyName.textContent = `${baseCompanyData.company} - 獨立分析`;
+                modalBodyAnalysis.innerHTML = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">${document.getElementById('summary-cards').innerHTML.replace(/lg:grid-cols-6/g, '')}</div>`;
+            } else {
+                modalCompanyName.textContent = `${baseCompanyData.company} vs ${compareCompanyData.company}`;
+                modalBodyAnalysis.innerHTML = createComparisonTable(baseCompanyData, compareCompanyData);
+            }
+            analysisModal.classList.remove('hidden');
+            analysisModal.classList.add('flex');
+            setTimeout(() => analysisModal.querySelector('div').classList.remove('scale-95'), 10);
+        }
+
+        function createComparisonTable(base, compare) {
+            const metrics = [ 
+                { label: '作品總數', key: 'works_today' }, 
+                { label: '瀏覽總數', key: 'views' }, 
+                { label: '作品客戶收藏總數', key: 'collects_today' }, 
+                { label: '客戶諮詢總數', key: 'inquiries_today' }, 
+                { label: '作品開箱文', key: 'unboxing_today' },
+                { label: '施工動態', key: 'construction_dynamics_today' }
+            ];
+            let tableHTML = `<div class="overflow-x-auto"><table class="w-full text-sm text-left">
+                <thead class="text-xs text-gray-700 uppercase bg-gray-50 rounded-t-lg"><tr>
+                    <th class="px-4 py-3">指標</th>
+                    <th class="px-4 py-3 text-center">${base.company.split('(')[0]}</th>
+                    <th class="px-4 py-3 text-center">${compare.company.split('-')[0]}</th>
+                    <th class="px-4 py-3 text-center">差異</th>
+                    <th class="px-4 py-3 text-center">差異變動 (vs 昨日)</th>
+                </tr></thead><tbody>`;
+            metrics.forEach(metric => {
+                const baseValueRaw = base[metric.key];
+                const compareValueRaw = compare[metric.key];
+                const baseValueNum = parseValue(baseValueRaw);
+                const compareValueNum = parseValue(compareValueRaw);
+                const baseValuePrevNum = parseValue(base[metric.key + '_prev']);
+                const compareValuePrevNum = parseValue(compare[metric.key + '_prev']);
+                let diffHTML = '<span class="text-gray-500">-</span>';
+                let trendHTML = '<span class="text-gray-500">-</span>';
+                if (baseValueNum !== null && compareValueNum !== null) {
+                    const diff = baseValueNum - compareValueNum;
+                    diffHTML = `<span class="font-bold">${diff.toLocaleString()}</span>`;
+                    if (baseValuePrevNum !== null && compareValuePrevNum !== null) {
+                        const diffPrev = baseValuePrevNum - compareValuePrevNum;
+                        const diffChange = diff - diffPrev;
+                        if (diffChange !== 0) {
+                            const isWidening = diffChange > 0;
+                            const color = isWidening ? 'text-red-500' : 'text-green-500';
+                            const text = isWidening ? '拉大' : '拉小';
+                            const icon = isWidening ? `↑` : `↓`;
+                            trendHTML = `<span class="${color} font-semibold flex items-center justify-center">${icon} ${text} ${Math.abs(diffChange).toLocaleString()}</span>`;
+                        } else {
+                            trendHTML = `<span class="text-gray-500 flex items-center justify-center">─ 0</span>`;
+                        }
+                    }
+                }
+                tableHTML += `<tr class="border-b hover:bg-gray-50"><td class="px-4 py-3 font-medium text-gray-900">${metric.label}</td>
+                                <td class="px-4 py-3 text-center">${baseValueRaw}</td><td class="px-4 py-3 text-center">${compareValueRaw}</td>
+                                <td class="px-4 py-3 text-center">${diffHTML}</td>
+                                <td class="px-4 py-3 text-center">${trendHTML}</td></tr>`;
+            });
+            return tableHTML + `</tbody></table></div>`;
+        }
+        
+        async function performAiSearch() {
+            const userQuery = searchInput.value.trim();
+            if (!userQuery) return;
+
+            aiResultsContent.innerHTML = `
+                <div class="flex flex-col justify-center items-center p-8 text-center">
+                    <div class="loader"></div>
+                    <p class="mt-4 text-gray-600 font-medium">AI 智慧助理正在為您整合分析...</p>
+                    <p class="mt-1 text-sm text-gray-500">正在同步內部數據與網路資訊</p>
+                </div>`;
+            aiResultsSection.classList.remove('hidden');
+            aiResultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+            let internalDataSummary = '';
+            let queryType = 'external'; // external, internal, hybrid
+            const hybridKeywords = ['競爭', '市場', '影響', '策略', '評估'];
+
+            // Use the global companyData (from Firestore)
+            const mentionedCompanies = companyData.filter(c => 
+                userQuery.toLowerCase().includes(c.company.toLowerCase().split('(')[0].split('-')[0].trim())
+            );
+            
+            let systemInstructionText;
+
+            if (mentionedCompanies.length > 0) {
+                 queryType = hybridKeywords.some(kw => userQuery.includes(kw)) ? 'hybrid' : 'internal';
+                 internalDataSummary = '儀表板內部數據（11月1日）:\n'; // Date updated
+                 mentionedCompanies.forEach(c => {
+                     internalDataSummary += `關於 ${c.company} 的數據：作品總數 ${c.works_today}、瀏覽總數 ${c.views}、作品客戶收藏總數 ${c.collects_today}、客戶諮詢總數 ${c.inquiries_today}、施工動態 ${c.construction_dynamics_today}。\n`;
+                 });
+
+                 if(queryType === 'hybrid') {
+                      systemInstructionText = "你是一位頂尖的商業策略顧問。你的任務是整合我提供的「儀表板內部數據」以及最新的「Google網路搜尋結果」。請先分析內部數據的現況與差異，然後結合外部市場資訊（如競爭者動態、市場趨勢），最終針對使用者的問題提供一份綜合性的策略建議或分析報告。請明確區分哪些洞察來自內部數據，哪些來自外部資訊。請用繁體中文進行分析。";
+                 } else { // internal
+                      if (mentionedCompanies.length > 1) {
+                         systemInstructionText = "你是一位專業的數據分析師。你的唯一任務是針對我提供的「儀表板內部數據」，對使用者問題中提到的公司，就以下五項核心網路數據進行嚴格的數據差異比較：『作品總數』、『瀏覽總數』、『作品客戶收藏總數』、『客戶諮詢總數』、『施工動態』。你的回答必須完全基於這些數據的比較，以條列式呈現，例如「在作品總數上，A公司比B公司多出X件」。在完成數據比較後，才可利用Google搜尋結果，對這些數據差異提供簡短的外部市場觀察作為補充。分析的絕對核心是儀表板數據，禁止將外部資訊作為主要分析內容。請用繁體中文進行分析。";
+                      } else {
+                         systemInstructionText = "你是一位專業的數據分析師。你的任務是針對我提供的「儀表板內部數據」，對提到的公司進行數據總結。請條列式地列出該公司的五項核心網路數據（作品總數、瀏覽總數、作品客戶收藏總數、客戶諮詢總數、施工動態），並結合最新的「Google網路搜尋結果」提供關於該公司的市場觀察或近期動態作為補充。請用繁體中文進行分析。";
+                      }
+                 }
+            } else { // external
+                 systemInstructionText = "你是一位全能的智慧助理。請根據最新的 Google 網路搜尋結果，用繁體中文、條列式地簡潔回答使用者的問題。";
+            }
+
+            const finalQuery = `${internalDataSummary}\n\n${userQuery}`;
+            const apiKey = ""; 
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            
+            const payload = {
+                contents: [{ parts: [{ text: finalQuery }] }],
+                tools: [{ "google_search": {} }],
+                systemInstruction: {
+                    parts: [{ text: systemInstructionText }]
+                },
+            };
+            
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!response.ok) throw new Error(`API 請求失敗: ${response.status}`);
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    const text = candidate.content.parts[0].text;
+                    let sources = [];
+                    const groundingMetadata = candidate.groundingMetadata;
+                    if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                        sources = groundingMetadata.groundingAttributions
+                            .map(attr => ({ uri: attr.web?.uri, title: attr.web?.title }))
+                            .filter(source => source.uri && source.title);
+                    }
+                    displaySearchResults(text, sources, queryType);
+                } else {
+                   throw new Error("AI 無法產生有效的回覆。");
+                }
+            } catch (error) {
+                console.error("AI Search Error: ", error); // Log the error to console
+                aiResultsContent.innerHTML = `<p class="text-red-500 p-4">搜尋時發生錯誤：${error.message}</p>`;
+            }
+        }
+
+        function displaySearchResults(text, sources, queryType) {
+            const formattedText = text.replace(/\n/g, '<br>');
+            
+            let sourceLabelText = '';
+            let sourceLabelColor = '';
+            switch(queryType) {
+                case 'internal':
+                    sourceLabelText = '內部資料分析';
+                    sourceLabelColor = 'bg-blue-100 text-blue-800';
+                    break;
+                case 'external':
+                    sourceLabelText = 'Google AI 查詢';
+                     sourceLabelColor = 'bg-green-100 text-green-800';
+                    break;
+                case 'hybrid':
+                    sourceLabelText = '綜合內外部資訊分析';
+                     sourceLabelColor = 'bg-purple-100 text-purple-800';
+                    break;
+            }
+            const sourceLabelHTML = `<div class="mb-4"><span class="text-xs font-semibold inline-block py-1 px-2 uppercase rounded-full ${sourceLabelColor}">${sourceLabelText}</span></div>`;
+
+            let sourcesHTML = '';
+            if (sources.length > 0) {
+                sourcesHTML = `<div class="mt-8">
+                    <h4 class="text-sm font-semibold mb-3 text-gray-600 border-t pt-4">參考資料來源</h4>
+                    <ul class="space-y-2">`;
+                sources.forEach(source => {
+                    sourcesHTML += `
+                        <li class="flex items-start">
+                            <svg class="w-4 h-4 text-indigo-400 mr-2 mt-1 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+                            <a href="${source.uri}" target="_blank" rel="noopener noreferrer" class="text-indigo-600 hover:underline text-sm">${source.title}</a>
+                        </li>`;
+                });
+                sourcesHTML += '</ul></div>';
+            }
+            aiResultsContent.innerHTML = `${sourceLabelHTML}<div class="prose-custom text-gray-800">${formattedText}</div>${sourcesHTML}`;
+        }
+
+        function hideModal(modal) {
+            modal.querySelector('div').classList.add('scale-95');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }, 300);
+        }
+        
+    </script>
+</body>
+</html>
